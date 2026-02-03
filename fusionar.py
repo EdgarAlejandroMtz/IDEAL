@@ -17,7 +17,7 @@ PP_MONTO_COL = {
     6: "MONTO_REC_ PP6",
     7: "MONTO_REC_ PP7",
 }
-PP_REC_TOTAL_COL = {pp: f"REC_TOTAL_ PP{pp}" for pp in PP_LIST}  # nota el espacio
+PP_REC_TOTAL_COL = {pp: f"REC_TOTAL_ PP{pp}" for pp in PP_LIST}  # (ya no se usa para INGRESO_TOTAL)
 PP_PCT_COL = {pp: f"PCTJE_COM_REC_PP{pp}" for pp in PP_LIST}
 PP_EST_COL = {pp: f"ESTATUS_REC_PP{pp}" for pp in PP_LIST}
 PP_MOT_COL = {pp: f"MOTIVO_RECHAZO_PP{pp}" for pp in PP_LIST}
@@ -91,13 +91,11 @@ def compute_row_max_date(df: pd.DataFrame) -> pd.Series:
     if not cols:
         return pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
 
-    # Convertimos cada columna a datetime (soporta serial)
     dt_cols = []
     for c in cols:
         dt_cols.append(excel_serial_to_datetime(df[c]))
 
     dt_df = pd.concat(dt_cols, axis=1)
-    # max row-wise
     return dt_df.max(axis=1)
 
 def non_empty_mask(df: pd.DataFrame, cols: list[str]) -> pd.Series:
@@ -113,7 +111,6 @@ def non_empty_mask(df: pd.DataFrame, cols: list[str]) -> pd.Series:
     for c in cols:
         s = df[c]
         m = s.notna() & s.astype(str).str.strip().ne("")
-        # eliminar strings tipo nan/none/null
         low = s.astype(str).str.strip().str.lower()
         m = m & ~low.isin({"nan", "none", "null"})
         mask = mask | m
@@ -125,21 +122,33 @@ def pp_block_cols(pp: int) -> list[str]:
         PP_MOT_COL[pp],
         PP_MONTO_COL[pp],
         PP_PCT_COL[pp],
-        PP_REC_TOTAL_COL[pp],
+        PP_REC_TOTAL_COL[pp],  # se conserva por si existe, aunque no lo usemos en ingreso
         PP_MES_COL[pp],
     ]
 
+# =========================
+# ✅ INGRESO_TOTAL (lo que tú pediste)
+# MONTO_COM_INIC + MONTO_REC_PP1..PP7 + MONTO_BP1 + MONTO_BP2
+# =========================
 def recompute_ingreso_total(df: pd.DataFrame) -> pd.DataFrame:
     ingreso = to_float_series(df.get("MONTO_COM_INIC", pd.Series([None] * len(df)))).fillna(0)
+
     for pp in PP_LIST:
-        col = PP_REC_TOTAL_COL[pp]
-        if col in df.columns:
-            ingreso = ingreso + to_float_series(df[col]).fillna(0)
+        col_monto = PP_MONTO_COL.get(pp)
+        if col_monto and col_monto in df.columns:
+            ingreso = ingreso + to_float_series(df[col_monto]).fillna(0)
+
+    if "MONTO_BP1" in df.columns:
+        ingreso = ingreso + to_float_series(df["MONTO_BP1"]).fillna(0)
+
+    if "MONTO_BP2" in df.columns:
+        ingreso = ingreso + to_float_series(df["MONTO_BP2"]).fillna(0)
+
     df["INGRESO_TOTAL"] = ingreso
     return df
 
 # =========================
-# Merge optimizado (sin groupby apply)
+# Merge optimizado (rápido)
 # =========================
 def merge_masters_fast(paths: list[str], progress_cb=None) -> pd.DataFrame:
     dfs = []
@@ -162,22 +171,21 @@ def merge_masters_fast(paths: list[str], progress_cb=None) -> pd.DataFrame:
 
     all_df = pd.concat(dfs, ignore_index=True)
 
-    # 2) Ordenar una sola vez por fecha (y por orden de aparición como desempate estable)
+    # 2) Ordenar una sola vez por fecha (estable)
     if callable(progress_cb):
         progress_cb(50, "Ordenando por fecha...")
 
     all_df["__ORDER__"] = range(len(all_df))
     all_df = all_df.sort_values(["__ROW_DATE__", "__ORDER__"], kind="mergesort")
 
-    # 3) Base general: quedarte con el registro más nuevo por LINEA
+    # 3) Base general: registro más nuevo por LINEA
     if callable(progress_cb):
         progress_cb(60, "Consolidando base por LINEA...")
 
     base = all_df.drop_duplicates(subset=["LINEA"], keep="last").copy()
     base = base.set_index("LINEA", drop=False)
 
-    # 4) Para cada PP: tomar el registro más nuevo por LINEA que tenga data en ese PP, y actualizar columnas
-    #    (solo 7 + 2 bloques => rápido)
+    # 4) Para cada PP: tomar el registro más nuevo con data en ese PP y actualizar columnas
     step = 30 / 9.0
     pval = 60.0
 
@@ -194,11 +202,12 @@ def merge_masters_fast(paths: list[str], progress_cb=None) -> pd.DataFrame:
             picked = picked.sort_values(["__ROW_DATE__", "__ORDER__"], kind="mergesort")
             picked = picked.drop_duplicates(subset=["LINEA"], keep="last").set_index("LINEA")
 
-            # update: sobreescribe solo donde venga valor no vacío
             for c in cols_present:
                 src = picked[c]
                 m = src.notna() & src.astype(str).str.strip().ne("") & ~src.astype(str).str.strip().str.lower().isin({"nan","none","null"})
-                base.loc[m.index[m], c] = src.loc[m]
+                idx = m.index[m]
+                if len(idx) > 0:
+                    base.loc[idx, c] = src.loc[idx]
 
         pval += step
         if callable(progress_cb):
@@ -217,13 +226,15 @@ def merge_masters_fast(paths: list[str], progress_cb=None) -> pd.DataFrame:
                 for c in cols_present:
                     src = picked[c]
                     m = src.notna() & src.astype(str).str.strip().ne("") & ~src.astype(str).str.strip().str.lower().isin({"nan","none","null"})
-                    base.loc[m.index[m], c] = src.loc[m]
+                    idx = m.index[m]
+                    if len(idx) > 0:
+                        base.loc[idx, c] = src.loc[idx]
 
         pval += step
         if callable(progress_cb):
             progress_cb(int(pval), f"Aplicando {label}...")
 
-    # 6) Recalcular ingreso total
+    # 6) Recalcular ingreso total (con tus columnas)
     if callable(progress_cb):
         progress_cb(95, "Recalculando INGRESO_TOTAL...")
 
@@ -240,7 +251,6 @@ def merge_masters_fast(paths: list[str], progress_cb=None) -> pd.DataFrame:
         progress_cb(100, "Listo ✅")
 
     return out
-
 
 # =========================
 # GUI
@@ -290,10 +300,10 @@ class MergeApp(tk.Tk):
 
         tips = tk.Frame(card)
         tips.pack(fill="x", padx=12, pady=(0, 12))
-        tk.Label(tips, text="Optimización:", font=("Arial", 10, "bold")).pack(anchor="w")
+        tk.Label(tips, text="INGRESO_TOTAL:", font=("Arial", 10, "bold")).pack(anchor="w")
         tk.Label(
             tips,
-            text="Evita groupby-apply. Usa sort + drop_duplicates y actualiza PP/BP por bloques (vectorizado).",
+            text="Se calcula con MONTO_COM_INIC + MONTO_REC_PP1..PP7 + MONTO_BP1 + MONTO_BP2 (NO usa REC_TOTAL_).",
             fg="gray",
         ).pack(anchor="w")
 
