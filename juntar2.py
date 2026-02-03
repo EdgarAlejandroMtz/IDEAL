@@ -1,0 +1,1215 @@
+import os
+import re
+import unicodedata
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import traceback
+
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+# =========================
+# SQL DEFAULTS (editable en UI)
+# =========================
+DEFAULT_SQL_SERVER = "192.168.10.68"
+DEFAULT_SQL_PORT = "1433"
+SQL_DB = "DatosLocales"
+SQL_TABLE = "dbo.Datos_Integrales"
+SQL_USER = "sa"
+
+# =========================
+# ENCABEZADOS DEL MAESTRO (CSV)
+# =========================
+MASTER_HEADERS = [
+    "LINEA","TIPO_CAMBACEO","ID_PORT","SIM","FECHA_CAPTURA","FECHA_EXITOSO","FECHA_PROC_EXITOSO",
+    "FECHA_PRIM_ING","FECHA_ACTIVACION","FECHA_ALTA","ESTATUS_ACTUAL","DONADOR","FECHA_PORTOUT",
+    "PROMOTOR","NUM_PROMOTOR","FECHA_ALTA_PROMOTOR","SUPERVISOR","NUM_SUPERVISOR","GPO_SUPERVISOR",
+    "PLAZA","COORDINADOR","NUM_COORDINADOR","GERENTE_REGIONAL","REGION","ESTATUS_COMISION_INICIAL",
+    "MOTIVO_RECHAZO_CI","MONTO_COM_INIC","MES_COM_INIC",
+    "ESTATUS_REC_PP1","MOTIVO_RECHAZO_PP1","MONTO_REC_PP1","PCTJE_COM_REC_PP1","REC_TOTAL_ PP1","MES_REC_PP1",
+    "ESTATUS_REC_PP2","MOTIVO_RECHAZO_PP2","MONTO_REC_ PP2","PCTJE_COM_REC_PP2","REC_TOTAL_ PP2","MES_REC_PP2",
+    "ESTATUS_BP1","MOTIVO_RECHAZO_BP1","MONTO_BP1","PP_BP1","MES_BP1",
+    "ESTATUS_REC_PP3","MOTIVO_RECHAZO_PP3","MONTO_REC_ PP3","PCTJE_COM_REC_PP3","REC_TOTAL_ PP3","MES_REC_PP3",
+    "ESTATUS_BP2","MOTIVO_RECHAZO_BP2","MONTO_BP2","PP_BP2","MES_BP2",
+    "ESTATUS_REC_PP4","MOTIVO_RECHAZO_PP4","MONTO_REC_ PP4","PCTJE_COM_REC_PP4","REC_TOTAL_ PP4","MES_PP4",
+    "ESTATUS_REC_PP5","MOTIVO_RECHAZO_PP5","MONTO_REC_ PP5","PCTJE_COM_REC_PP5","REC_TOTAL_ PP5","MES_PP5",
+    "ESTATUS_REC_PP6","MOTIVO_RECHAZO_PP6","MONTO_REC_ PP6","PCTJE_COM_REC_PP6","REC_TOTAL_ PP6","MES_PP6",
+    "ESTATUS_REC_PP7","MOTIVO_RECHAZO_PP7","MONTO_REC_ PP7","PCTJE_COM_REC_PP7","REC_TOTAL_ PP7","MES_PP7",
+    "INGRESO_TOTAL"
+]
+
+# =========================
+# Normalización / helpers
+# =========================
+def normalize_header(s: str) -> str:
+    s = str(s).strip()
+    s = s.replace("_", " ")
+    s = " ".join(s.split())
+    s = s.upper()
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    return s
+
+def norm_key(s: str) -> str:
+    s = "" if s is None else str(s)
+    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    s = s.upper().strip()
+    s = re.sub(r"[\s_\-\.]+", "", s)
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    return s
+
+def normalize_line_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+
+def to_float_series(x: pd.Series) -> pd.Series:
+    s = x.astype(str).str.strip()
+    s = s.str.replace("%", "", regex=False)
+    s = s.str.replace(",", "", regex=False)
+    return pd.to_numeric(s, errors="coerce")
+
+def pct_to_fraction(pct: pd.Series) -> pd.Series:
+    p = to_float_series(pct)
+    return p.where(p <= 1, p / 100.0)
+
+MESES_ES = {
+    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
+    5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
+    9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"
+}
+MESES_ES_INV = {v.upper(): k for k, v in MESES_ES.items()}
+
+def month_name_es_from_series(date_series: pd.Series) -> pd.Series:
+    if date_series is None:
+        return None
+    dt = pd.to_datetime(date_series, errors="coerce")
+    return dt.dt.month.map(MESES_ES)
+
+def add_months_from_month_name_es(base_month_name: pd.Series, offset_months: int) -> pd.Series:
+    mnum = base_month_name.astype(str).str.strip().str.upper().map(MESES_ES_INV)
+    out_num = ((mnum - 1 + offset_months) % 12) + 1
+    return out_num.map(MESES_ES)
+
+def dedup_fast(df: pd.DataFrame, key: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    return df.drop_duplicates(subset=[key], keep="last")
+
+# ---- soporte xlsb ----
+def _excel_engine_for(path: str):
+    return "pyxlsb" if str(path).lower().endswith(".xlsb") else None
+
+# =========================
+# LECTURA RÁPIDA (usecols) ✅ matching robusto
+# =========================
+def read_excel_fast(path, sheet_name, needed_headers_human):
+    needed_norm = {norm_key(x) for x in needed_headers_human}
+    def _usecols(colname):
+        return norm_key(colname) in needed_norm
+    engine = _excel_engine_for(path)
+    return pd.read_excel(path, sheet_name=sheet_name, dtype=object, usecols=_usecols, engine=engine)
+
+def safe_pick_col(df, *candidates):
+    if df is None or df.empty:
+        return None
+    norm_map = {norm_key(c): c for c in df.columns}
+    for cand in candidates:
+        key = norm_key(cand)
+        if key in norm_map:
+            return norm_map[key]
+    return None
+
+def pick_series(df: pd.DataFrame, *candidates, required=False, label=""):
+    col = safe_pick_col(df, *candidates)
+    if not col:
+        if required:
+            msg = f"No encontré la columna requerida: {label or candidates}.\nColumnas disponibles: {list(df.columns)}"
+            raise ValueError(msg)
+        return None
+    return df[col]
+
+# =========================
+# Fechas (Excel serial -> datetime) ✅ FIX 1970
+# =========================
+def excel_serial_to_datetime(series: pd.Series) -> pd.Series:
+    if series is None:
+        return None
+
+    s = series.copy()
+    nums = pd.to_numeric(s, errors="coerce")
+    is_excel = nums.notna() & (nums > 59) & (nums < 90000)
+
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+
+    if is_excel.any():
+        out.loc[is_excel] = pd.to_datetime(
+            nums.loc[is_excel],
+            unit="D",
+            origin="1899-12-30",
+            errors="coerce"
+        )
+
+    other = ~is_excel
+    if other.any():
+        out.loc[other] = pd.to_datetime(s.loc[other], errors="coerce", dayfirst=False)
+
+    return out.dt.round("s")
+
+# =========================
+# CONFIG (REC/BP)
+# =========================
+PP_LIST = [1,2,3,4,5,6,7]
+PP_MONTO_COL   = {
+    1: "MONTO_REC_PP1",
+    2: "MONTO_REC_ PP2",
+    3: "MONTO_REC_ PP3",
+    4: "MONTO_REC_ PP4",
+    5: "MONTO_REC_ PP5",
+    6: "MONTO_REC_ PP6",
+    7: "MONTO_REC_ PP7",
+}
+PP_REC_TOTAL_COL = {
+    1: "REC_TOTAL_ PP1",
+    2: "REC_TOTAL_ PP2",
+    3: "REC_TOTAL_ PP3",
+    4: "REC_TOTAL_ PP4",
+    5: "REC_TOTAL_ PP5",
+    6: "REC_TOTAL_ PP6",
+    7: "REC_TOTAL_ PP7",
+}
+PP_MES_COL = {
+    1: "MES_REC_PP1",
+    2: "MES_REC_PP2",
+    3: "MES_REC_PP3",
+    4: "MES_PP4",
+    5: "MES_PP5",
+    6: "MES_PP6",
+    7: "MES_PP7",
+}
+
+# =========================
+# DETECCIÓN DE ROL DE PESTAÑA
+# =========================
+def sheet_role_by_name(sheet_name: str) -> str | None:
+    s = normalize_header(sheet_name)
+    s = " ".join(s.split()).strip()
+    s = re.sub(r"^(AJUSTE|AJUSTES)\s+", "", s).strip()
+    k = norm_key(s)
+
+    def has_any(subs: list[str]) -> bool:
+        return any(sub in k for sub in subs)
+
+    if (
+        has_any(["BP2", "BP02", "BONO2", "BONO02"]) or
+        ("BP" in k and k.endswith("2")) or
+        bool(re.search(r"\bBP\s*2\b", s)) or
+        bool(re.search(r"\bBONO\s*2\b", s)) or
+        bool(re.search(r"\bBONOPRODUCTIVIDAD\s*2\b", k))
+    ):
+        return "BP2"
+
+    if (
+        has_any(["BP", "BONO", "BONOPRODUCTIVIDAD"]) and
+        not has_any(["BP2", "BP02", "BONO2", "BONO02"])
+    ):
+        return "BP"
+
+    if has_any(["REC", "RECARGA", "RECARGAS", "RECARG"]) or bool(re.search(r"\bREC\b", s)):
+        return "REC"
+
+    if has_any(["CI", "COMISIONINICIAL", "COMISIONIN"]) or bool(re.search(r"\bCI\b", s)):
+        return "CI"
+
+    return None
+
+def _sheet_columns_fast(path: str, sheet_name: str) -> list[str]:
+    engine = _excel_engine_for(path)
+    try:
+        df0 = pd.read_excel(path, sheet_name=sheet_name, nrows=0, engine=engine)
+        return list(df0.columns)
+    except Exception:
+        return []
+
+def _read_sample_series(path: str, sheet_name: str, col_candidates: list[str], nrows: int = 1200) -> pd.Series | None:
+    cols = _sheet_columns_fast(path, sheet_name)
+    if not cols:
+        return None
+    norm_map = {norm_key(c): c for c in cols}
+
+    pick = None
+    for cand in col_candidates:
+        k = norm_key(cand)
+        if k in norm_map:
+            pick = norm_map[k]
+            break
+    if not pick:
+        return None
+
+    engine = _excel_engine_for(path)
+    try:
+        df = pd.read_excel(path, sheet_name=sheet_name, usecols=[pick], nrows=nrows, dtype=object, engine=engine)
+        if df.empty:
+            return None
+        return df[pick]
+    except Exception:
+        return None
+
+def sheet_role_by_periodo(path: str, sheet_name: str) -> str | None:
+    cols = _sheet_columns_fast(path, sheet_name)
+    if not cols:
+        return None
+
+    col_keys = {norm_key(c) for c in cols}
+
+    has_line = any(k in col_keys for k in ["LINEA", "TEL", "TELEFONO", "NUMTELPO", "NUMTEL"])
+    has_monto = "MONTO" in col_keys
+    has_estatus = any(k in col_keys for k in ["ESTATUSCOMISION", "ESTATUS", "ESTATUSCO", "ESTATUS_COMISION"])
+
+    if not (has_line and has_monto and has_estatus):
+        return None
+
+    periodo_ser = _read_sample_series(
+        path, sheet_name,
+        col_candidates=[
+            "periodo_participacion",
+            "periodo participacion",
+            "PERIODO_PARTICIPACION",
+            "periodo_p",
+            "periodo p",
+            "periodo"
+        ],
+        nrows=2000
+    )
+    if periodo_ser is None:
+        return None
+
+    p = pd.to_numeric(periodo_ser, errors="coerce").dropna()
+    if p.empty:
+        return None
+
+    p = p[p.isin([1,2,3,4,5,6,7])]
+    if p.empty:
+        return None
+
+    uniq = sorted(set(int(x) for x in p.unique()))
+
+    if uniq == [1]:
+        return "CI"
+    if uniq == [2]:
+        return "BP"
+    if uniq == [4]:
+        return "BP2"
+
+    if any(u in {3,5,6,7} for u in uniq):
+        return "REC"
+
+    if len(uniq) > 1:
+        return "REC"
+
+    return None
+
+def sheet_role(path: str, sheet_name: str) -> str | None:
+    r = sheet_role_by_name(sheet_name)
+    if r is not None:
+        return r
+    return sheet_role_by_periodo(path, sheet_name)
+
+# =========================
+# SQL UPLOAD (decimales + fechas por tipo SQL) ✅
+# + inserción por chunks + callback de progreso ✅
+# =========================
+def upload_dataframe_to_sqlserver(
+    df: pd.DataFrame,
+    password: str,
+    server: str,
+    port: str,
+    database: str,
+    table: str,
+    user: str,
+    progress_callback=None,
+    chunk_size: int = 5000
+):
+    import numpy as np
+    import pyodbc
+    from decimal import Decimal, ROUND_HALF_UP
+
+    drivers = [d for d in pyodbc.drivers()]
+    driver = None
+    for cand in ["ODBC Driver 18 for SQL Server", "ODBC Driver 17 for SQL Server"]:
+        if cand in drivers:
+            driver = cand
+            break
+    if not driver:
+        raise RuntimeError("No encontré ODBC Driver 17/18 for SQL Server instalado.")
+
+    server_tcp = f"tcp:{server},{port}"
+    conn_str = (
+        f"DRIVER={{{driver}}};"
+        f"SERVER={server_tcp};"
+        f"DATABASE={database};"
+        f"UID={user};"
+        f"PWD={password};"
+        "Encrypt=no;"
+        "TrustServerCertificate=yes;"
+        "Connection Timeout=10;"
+    )
+
+    total_rows = 0 if df is None else int(len(df))
+
+    conn = pyodbc.connect(conn_str, autocommit=False)
+    try:
+        cur = conn.cursor()
+        cur.execute("SET NOCOUNT ON;")
+
+        if "." in table:
+            schema, tname = table.split(".", 1)
+        else:
+            schema, tname = "dbo", table
+
+        cur.execute("""
+            SELECT
+                COLUMN_NAME,
+                DATA_TYPE,
+                NUMERIC_PRECISION,
+                NUMERIC_SCALE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+            ORDER BY ORDINAL_POSITION
+        """, (schema, tname))
+        rows = cur.fetchall()
+        if not rows:
+            raise RuntimeError(f"No pude leer columnas de la tabla {table} en {database}.")
+
+        table_cols = [r[0] for r in rows]
+        info = {
+            r[0]: {"type": (r[1] or "").lower(), "prec": r[2], "scale": r[3]}
+            for r in rows
+        }
+        table_norm = {norm_key(c): c for c in table_cols}
+
+        manual_map = {
+            "TIPO_CAMBACEO": "Tipo_Cambaceo",
+            "ID_PORT": "Id_Port",
+            "FECHA_CAPTURA": "Fecha_Captura",
+            "FECHA_EXITOSO": "Fecha_Exitoso",
+            "FECHA_PROC_EXITOSO": "Fecha_Proc_Exitoso",
+            "FECHA_PRIM_ING": "Fecha_Primer_Ing",
+            "FECHA_ACTIVACION": "Fecha_Activacion",
+            "FECHA_ALTA": "Fecha_Alta",
+            "ESTATUS_ACTUAL": "Estatus_Actual",
+            "DONADOR": "Donador",
+            "FECHA_PORTOUT": "Fecha_Portout",
+            "PROMOTOR": "Promotor",
+            "NUM_PROMOTOR": "Nomina_P",
+            "FECHA_ALTA_PROMOTOR": "Fecha_Ing",
+            "SUPERVISOR": "Supervisor",
+            "NUM_SUPERVISOR": "Nomina_S",
+            "GPO_SUPERVISOR": "Gpo_Sup",
+            "PLAZA": "Plaza",
+            "COORDINADOR": "Coordinador",
+            "NUM_COORDINADOR": "Nomina_C",
+            "GERENTE_REGIONAL": "Ger_Reg",
+            "REGION": "Region",
+            "ESTATUS_COMISION_INICIAL": "Estatus_CI",
+            "MOTIVO_RECHAZO_CI": "Mot_Rech_CI",
+            "MONTO_COM_INIC": "Monto_CI",
+            "MES_COM_INIC": "Mes_CI",
+            "INGRESO_TOTAL": "Ingreso_Total",
+
+            "ESTATUS_REC_PP1": "Est_Rec_PP1",
+            "MOTIVO_RECHAZO_PP1": "Mot_Rech_PP1",
+            "MONTO_REC_PP1": "Monto_Rec_PP1",
+            "PCTJE_COM_REC_PP1": "Pct_Rec_PP1",
+            "REC_TOTAL_ PP1": "Rec_Tot_PP1",
+            "MES_REC_PP1": "Mes_PP1",
+
+            "ESTATUS_REC_PP2": "Est_Rec_PP2",
+            "MOTIVO_RECHAZO_PP2": "Mot_Rech_PP2",
+            "MONTO_REC_ PP2": "Monto_Rec_PP2",
+            "PCTJE_COM_REC_PP2": "Pct_Rec_PP2",
+            "REC_TOTAL_ PP2": "Rec_Tot_PP2",
+            "MES_REC_PP2": "Mes_PP2",
+
+            "ESTATUS_REC_PP3": "Est_Rec_PP3",
+            "MOTIVO_RECHAZO_PP3": "Mot_Rech_PP3",
+            "MONTO_REC_ PP3": "Monto_Rec_PP3",
+            "PCTJE_COM_REC_PP3": "Pct_Rec_PP3",
+            "REC_TOTAL_ PP3": "Rec_Tot_PP3",
+            "MES_REC_PP3": "Mes_PP3",
+
+            "ESTATUS_REC_PP4": "Est_Rec_PP4",
+            "MOTIVO_RECHAZO_PP4": "Mot_Rech_PP4",
+            "MONTO_REC_ PP4": "Monto_Rec_PP4",
+            "PCTJE_COM_REC_PP4": "Pct_Rec_PP4",
+            "REC_TOTAL_ PP4": "Rec_Tot_PP4",
+            "MES_PP4": "Mes_PP4",
+
+            "ESTATUS_REC_PP5": "Est_Rec_PP5",
+            "MOTIVO_RECHAZO_PP5": "Mot_Rech_PP5",
+            "MONTO_REC_ PP5": "Monto_Rec_PP5",
+            "PCTJE_COM_REC_PP5": "Pct_Rec_PP5",
+            "REC_TOTAL_ PP5": "Rec_Tot_PP5",
+            "MES_PP5": "Mes_PP5",
+
+            "ESTATUS_REC_PP6": "Est_Rec_PP6",
+            "MOTIVO_RECHAZO_PP6": "Mot_Rech_PP6",
+            "MONTO_REC_ PP6": "Monto_Rec_PP6",
+            "PCTJE_COM_REC_PP6": "Pct_Rec_PP6",
+            "REC_TOTAL_ PP6": "Rec_Tot_PP6",
+            "MES_PP6": "Mes_PP6",
+
+            "ESTATUS_REC_PP7": "Est_Rec_PP7",
+            "MOTIVO_RECHAZO_PP7": "Mot_Rech_PP7",
+            "MONTO_REC_ PP7": "Monto_Rec_PP7",
+            "PCTJE_COM_REC_PP7": "Pct_Rec_PP7",
+            "REC_TOTAL_ PP7": "Rec_Tot_PP7",
+            "MES_PP7": "Mes_PP7",
+
+            "ESTATUS_BP1": "Est_BP1",
+            "MOTIVO_RECHAZO_BP1": "Mot_Rech_BP1",
+            "MONTO_BP1": "Monto_BP1",
+            "PP_BP1": "Pct_BP1",
+            "MES_BP1": "Mes_BP1",
+
+            "ESTATUS_BP2": "Est_BP2",
+            "MOTIVO_RECHAZO_BP2": "Mot_Rech_BP2",
+            "MONTO_BP2": "Monto_BP2",
+            "PP_BP2": "Pct_BP2",
+            "MES_BP2": "Mes_BP2",
+        }
+
+        rename_map = {}
+        used_targets = set()
+
+        for c in df.columns:
+            target = None
+            if c in manual_map:
+                cand = manual_map[c]
+                if cand in table_cols:
+                    target = cand
+                else:
+                    nk = norm_key(cand)
+                    if nk in table_norm:
+                        target = table_norm[nk]
+            else:
+                nk = norm_key(c)
+                if nk in table_norm:
+                    target = table_norm[nk]
+
+            if target and target in table_cols and target not in used_targets:
+                rename_map[c] = target
+                used_targets.add(target)
+
+        if not rename_map:
+            raise RuntimeError("No se pudo mapear ninguna columna del CSV a la tabla SQL.")
+
+        df2 = df[list(rename_map.keys())].copy().rename(columns=rename_map)
+
+        def to_decimal_or_none(x, scale, prec):
+            try:
+                from decimal import Decimal, ROUND_HALF_UP
+                if x is None:
+                    return None
+                if isinstance(x, float) and (pd.isna(x) or x in (float("inf"), float("-inf"))):
+                    return None
+
+                s = str(x).strip()
+                if s == "" or s.lower() in {"null", "none", "nan", "na", "n/a"}:
+                    return None
+
+                s = s.replace(",", "").replace("%", "").replace("$", "").replace(" ", "")
+                d = Decimal(s)
+                if d.is_nan() or d.is_infinite():
+                    return None
+
+                if scale is None: scale = 0
+                if prec is None: prec = 38
+                if int(scale) > int(prec): scale = prec
+
+                q = Decimal("1") if int(scale) == 0 else Decimal("1").scaleb(-int(scale))
+                d = d.quantize(q, rounding=ROUND_HALF_UP)
+
+                max_int_digits = int(prec) - int(scale)
+                if max_int_digits <= 0:
+                    return None
+                max_abs = Decimal(10) ** int(max_int_digits)
+                if abs(d) >= max_abs:
+                    return None
+                return d
+            except Exception:
+                return None
+
+        dec_types = {"decimal", "numeric"}
+        money_types = {"money", "smallmoney"}
+        date_types = {"date", "datetime", "datetime2", "smalldatetime", "datetimeoffset"}
+
+        import numpy as np
+        for col in list(df2.columns):
+            t = (info.get(col, {}).get("type") or "").lower()
+            if t in date_types:
+                dt_ser = excel_serial_to_datetime(df2[col])
+                df2[col] = dt_ser.apply(lambda v: None if pd.isna(v) else v.to_pydatetime())
+            elif t in dec_types or t in money_types:
+                prec = info[col]["prec"]
+                scale = info[col]["scale"]
+                df2[col] = df2[col].apply(lambda v: to_decimal_or_none(v, scale=scale, prec=prec))
+
+        df2 = df2.replace([np.inf, -np.inf], np.nan)
+        df2 = df2.astype(object)
+        df2 = df2.where(pd.notnull(df2), None)
+
+        col_sql = ", ".join([f"[{c}]" for c in df2.columns])
+        placeholders = ", ".join(["?"] * len(df2.columns))
+        sql = f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})"
+
+        cur.fast_executemany = True
+
+        CHUNK = int(chunk_size) if int(chunk_size) > 0 else 5000
+        inserted = 0
+        buffer = []
+
+        if callable(progress_callback):
+            progress_callback(0, total_rows)
+
+        for row in df2.itertuples(index=False, name=None):
+            buffer.append(row)
+            if len(buffer) >= CHUNK:
+                cur.executemany(sql, buffer)
+                inserted += len(buffer)
+                buffer.clear()
+                if callable(progress_callback):
+                    progress_callback(inserted, total_rows)
+
+        if buffer:
+            cur.executemany(sql, buffer)
+            inserted += len(buffer)
+            buffer.clear()
+            if callable(progress_callback):
+                progress_callback(inserted, total_rows)
+
+        conn.commit()
+        return inserted, list(df2.columns), rename_map
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+# =========================
+# LECTURA DE TODOS LOS ARCHIVOS SEPARACIÓN / ANALÍTICA
+# =========================
+def load_all_separacion(sep_paths: list[str], reporte_lineas: set[str]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    ci_parts = []
+    rec_parts = []
+    bp_parts = []
+
+    for sep in sep_paths:
+        engine = _excel_engine_for(sep)
+        xls = pd.ExcelFile(sep, engine=engine)
+
+        for sh in xls.sheet_names:
+            role = sheet_role(sep, sh)
+            if role is None:
+                continue
+
+            # -------- CI --------
+            if role == "CI":
+                ci_cols = [
+                    "LINEA","LÍNEA","TELÉFONO","TELEFONO","numTelPo","numTel",
+                    "estatus_comision","estatus_co","estatus",
+                    "motivo_rechazo","motivo_r","motivo",
+                    "monto",
+                    "fecha_portacion","fecha_por","fecha portacion","fecha por"
+                ]
+                df_ci = read_excel_fast(sep, sheet_name=sh, needed_headers_human=ci_cols)
+
+                lci = safe_pick_col(df_ci, "LINEA","LÍNEA","TELÉFONO","TELEFONO","numTelPo","numTel")
+                if not lci:
+                    continue
+
+                out = pd.DataFrame({"LINEA": normalize_line_series(df_ci[lci])})
+                out = out[out["LINEA"].isin(reporte_lineas)].copy()
+                if out.empty:
+                    continue
+
+                out["ESTATUS_COMISION_INICIAL"] = pick_series(df_ci.loc[out.index], "estatus_comision", "estatus_co", "estatus", required=False)
+                out["MOTIVO_RECHAZO_CI"] = pick_series(df_ci.loc[out.index], "motivo_rechazo", "motivo_r", "motivo", required=False)
+                out["MONTO_COM_INIC"] = pick_series(df_ci.loc[out.index], "monto", required=False)
+
+                fecha_port = pick_series(df_ci.loc[out.index], "fecha_portacion", "fecha_por", required=False)
+                out["MES_COM_INIC"] = month_name_es_from_series(fecha_port) if fecha_port is not None else None
+
+                ci_parts.append(out)
+
+            # -------- REC --------
+            elif role == "REC":
+                rec_cols = [
+                    "LINEA","LÍNEA","TELÉFONO","TELEFONO","numTelPo","numTel",
+                    "estatus_comision","estatus_co","estatus",
+                    "motivo_rechazo","motivo_r","motivo",
+                    "monto",
+                    "Porcentajedecomision","Porcentaje de comision","Porcentaje de comisión","PORCENTAJE_DE_COMISION","Porcentaje","porcentaje",
+                    "periodo_participacion","periodo participacion","periodo_p","periodo p","periodo"
+                ]
+                df_rec = read_excel_fast(sep, sheet_name=sh, needed_headers_human=rec_cols)
+
+                lrec = safe_pick_col(df_rec, "LINEA","LÍNEA","TELÉFONO","TELEFONO","numTelPo","numTel")
+                if not lrec:
+                    continue
+
+                tmp = pd.DataFrame()
+                tmp["LINEA"] = normalize_line_series(df_rec[lrec])
+                tmp = tmp[tmp["LINEA"].isin(reporte_lineas)].copy()
+                if tmp.empty:
+                    continue
+
+                tmp["PERIODO"] = pd.to_numeric(
+                    pick_series(df_rec.loc[tmp.index], "periodo_participacion","periodo participacion","periodo_p","periodo p","periodo", required=False),
+                    errors="coerce"
+                )
+                tmp["ESTATUS"] = pick_series(df_rec.loc[tmp.index], "estatus_comision","estatus_co","estatus", required=False)
+                tmp["MOTIVO"] = pick_series(df_rec.loc[tmp.index], "motivo_rechazo","motivo_r","motivo", required=False)
+                tmp["MONTO"] = pick_series(df_rec.loc[tmp.index], "monto", required=False)
+                tmp["PCTJE"] = pick_series(
+                    df_rec.loc[tmp.index],
+                    "Porcentajedecomision","Porcentaje de comision","Porcentaje de comisión","PORCENTAJE_DE_COMISION","Porcentaje","porcentaje",
+                    required=False
+                )
+
+                tmp = tmp[tmp["PERIODO"].isin(PP_LIST)].copy()
+                if not tmp.empty:
+                    rec_parts.append(tmp)
+
+            # -------- BP / BP2 --------
+            elif role in ("BP", "BP2"):
+                bp_cols = [
+                    "LINEA","LÍNEA","TELÉFONO","TELEFONO","numTelPo","numTel",
+                    "estatus_comision","estatus_co","estatus",
+                    "motivo_rechazo","motivo_r","motivo",
+                    "monto",
+                    "periodo_participacion","periodo participacion","periodo_p","periodo p","periodo"
+                ]
+                df_bp = read_excel_fast(sep, sheet_name=sh, needed_headers_human=bp_cols)
+
+                lbp = safe_pick_col(df_bp, "LINEA","LÍNEA","TELÉFONO","TELEFONO","numTelPo","numTel")
+                if not lbp:
+                    continue
+
+                b = pd.DataFrame()
+                b["LINEA"] = normalize_line_series(df_bp[lbp])
+                b = b[b["LINEA"].isin(reporte_lineas)].copy()
+                if b.empty:
+                    continue
+
+                b["PERIODO"] = pd.to_numeric(
+                    pick_series(df_bp.loc[b.index], "periodo_participacion","periodo participacion","periodo_p","periodo p","periodo", required=False),
+                    errors="coerce"
+                )
+                b["ESTATUS"] = pick_series(df_bp.loc[b.index], "estatus_comision","estatus_co","estatus", required=False)
+                b["MOTIVO"] = pick_series(df_bp.loc[b.index], "motivo_rechazo","motivo_r","motivo", required=False)
+                b["MONTO"] = pick_series(df_bp.loc[b.index], "monto", required=False)
+                b["ROLE"] = role
+                bp_parts.append(b)
+
+    # ---- CI wide ----
+    if ci_parts:
+        df_ci_out = pd.concat(ci_parts, ignore_index=True)
+        df_ci_out = dedup_fast(df_ci_out, "LINEA")
+    else:
+        df_ci_out = pd.DataFrame(columns=["LINEA","ESTATUS_COMISION_INICIAL","MOTIVO_RECHAZO_CI","MONTO_COM_INIC","MES_COM_INIC"])
+
+    # ---- REC wide ----
+    if rec_parts:
+        base = pd.concat(rec_parts, ignore_index=True)
+        base = base.dropna(subset=["LINEA","PERIODO"])
+        base = base.drop_duplicates(subset=["LINEA","PERIODO"], keep="last")
+
+        rec_wide = None
+        for pp in PP_LIST:
+            tmp = base[base["PERIODO"] == pp][["LINEA","ESTATUS","MOTIVO","MONTO","PCTJE"]].copy()
+            if tmp.empty:
+                continue
+
+            tmp = tmp.rename(columns={
+                "ESTATUS": f"ESTATUS_REC_PP{pp}",
+                "MOTIVO": f"MOTIVO_RECHAZO_PP{pp}",
+                "MONTO": PP_MONTO_COL[pp],
+                "PCTJE": f"PCTJE_COM_REC_PP{pp}",
+            })
+
+            m = to_float_series(tmp[PP_MONTO_COL[pp]])
+            p = pct_to_fraction(tmp[f"PCTJE_COM_REC_PP{pp}"])
+
+            rec_total = pd.Series([None]*len(tmp), index=tmp.index, dtype="float64")
+            ok = (p.notna()) & (p > 0) & (m.notna())
+            rec_total.loc[ok] = (m.loc[ok] / p.loc[ok])
+            tmp[PP_REC_TOTAL_COL[pp]] = rec_total
+
+            tmp = dedup_fast(tmp, "LINEA")
+            rec_wide = tmp if rec_wide is None else pd.merge(rec_wide, tmp, on="LINEA", how="outer")
+
+        if rec_wide is None:
+            rec_wide = pd.DataFrame(columns=["LINEA"])
+    else:
+        rec_wide = pd.DataFrame(columns=["LINEA"])
+
+    # ---- BP wide ----
+    if bp_parts:
+        b = pd.concat(bp_parts, ignore_index=True)
+        b = b.dropna(subset=["LINEA","PERIODO"])
+
+        out_parts = []
+
+        b1 = b[(b["ROLE"] == "BP") & (b["PERIODO"] == 2)].copy()
+        if not b1.empty:
+            o1 = pd.DataFrame({
+                "LINEA": b1["LINEA"],
+                "ESTATUS_BP1": b1["ESTATUS"],
+                "MOTIVO_RECHAZO_BP1": b1["MOTIVO"],
+                "MONTO_BP1": b1["MONTO"],
+                "PP_BP1": 2,
+                "MES_BP1": None
+            })
+            out_parts.append(o1)
+
+        b2 = b[(b["ROLE"] == "BP2") & (b["PERIODO"] == 4)].copy()
+        if not b2.empty:
+            o2 = pd.DataFrame({
+                "LINEA": b2["LINEA"],
+                "ESTATUS_BP2": b2["ESTATUS"],
+                "MOTIVO_RECHAZO_BP2": b2["MOTIVO"],
+                "MONTO_BP2": b2["MONTO"],
+                "PP_BP2": 4,
+                "MES_BP2": None
+            })
+            out_parts.append(o2)
+
+        if out_parts:
+            bp_wide = pd.concat(out_parts, ignore_index=True)
+            bp_wide = dedup_fast(bp_wide, "LINEA")
+        else:
+            bp_wide = pd.DataFrame(columns=["LINEA"])
+    else:
+        bp_wide = pd.DataFrame(columns=["LINEA"])
+
+    return df_ci_out, rec_wide, bp_wide
+
+# =========================
+# GUI
+# =========================
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Cargar Comisiones - Grupo Comercial Ideal")
+        self.geometry("950x650")
+        self.resizable(False, False)
+        self.configure(bg="#F0F4F8")
+
+        COLOR_HEADER = "#002060"
+        COLOR_BG = "#F0F4F8"
+        COLOR_CARD = "#FFFFFF"
+        COLOR_TEXT_PRIMARY = "#002060"
+
+        self.reporte_path = tk.StringVar(value="")
+        self.separacion_paths = []
+        self.separacion_label = tk.StringVar(value="")
+        self.sql_password = tk.StringVar(value="")
+        self.sql_server = tk.StringVar(value=DEFAULT_SQL_SERVER)
+        self.sql_port = tk.StringVar(value=DEFAULT_SQL_PORT)
+
+        header_frame = tk.Frame(self, bg=COLOR_HEADER, height=70)
+        header_frame.pack(fill="x", side="top")
+        header_frame.pack_propagate(False)
+
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            img_path = os.path.join(script_dir, "logo_header.png")
+            if HAS_PIL:
+                pil_img = Image.open(img_path)
+                base_height = 60
+                w_percent = (base_height / float(pil_img.size[1]))
+                w_size = int((float(pil_img.size[0]) * float(w_percent)))
+                pil_img = pil_img.resize((w_size, base_height), Image.Resampling.LANCZOS)
+                self.logo_img = ImageTk.PhotoImage(pil_img)
+            else:
+                self.logo_img = tk.PhotoImage(file=img_path)
+
+            lbl_logo = tk.Label(header_frame, image=self.logo_img, bg=COLOR_HEADER, bd=0)
+            lbl_logo.place(x=20, y=5)
+        except Exception:
+            lbl_grupo = tk.Label(header_frame, text="GRUPO COMERCIAL", fg="#A0A0A0", bg=COLOR_HEADER, font=("Arial", 10))
+            lbl_grupo.place(x=20, y=15)
+            lbl_ideal = tk.Label(header_frame, text="IDEAL", fg="#FF6600", bg=COLOR_HEADER, font=("Arial Black", 20, "bold"))
+            lbl_ideal.place(x=20, y=30)
+
+        main_container = tk.Frame(self, bg=COLOR_BG)
+        main_container.pack(fill="both", expand=True, padx=40, pady=20)
+
+        lbl_title = tk.Label(main_container, text="ARCHIVO MAESTRO", fg=COLOR_TEXT_PRIMARY, bg=COLOR_BG, font=("Arial", 22, "bold"))
+        lbl_title.pack(pady=(0, 20))
+
+        card_frame = tk.Frame(main_container, bg=COLOR_CARD, bd=0)
+        card_frame.pack(fill="both", expand=True, padx=20, pady=10, ipadx=20, ipady=20)
+
+        self._input_row(card_frame, 0, "Reporte Acumulado:", self.reporte_path, self.buscar_reporte, "#103050")
+        self._input_row(card_frame, 1, "Archivos Separación/Analítica:", self.separacion_label, self.buscar_separaciones, "#103050")
+
+        self._text_row(card_frame, 2, "Servidor SQL:", self.sql_server)
+        self._text_row(card_frame, 3, "Puerto:", self.sql_port)
+        self._password_row(card_frame, 4, "Contraseña SQL (sa):", self.sql_password)
+
+        btn_frame = tk.Frame(card_frame, bg=COLOR_CARD)
+        btn_frame.grid(row=6, column=0, columnspan=3, sticky="e", pady=(30, 10))
+
+        # ✅ NUEVO BOTÓN: solo generar CSV
+        self.btn_generar = tk.Button(
+            btn_frame, text="GENERAR CSV", width=15, height=1,
+            bg="#1f6feb", fg="white", font=("Arial", 11, "bold"),
+            relief="flat", cursor="hand2",
+            command=lambda: self.crear_maestro(upload_sql=False)
+        )
+        self.btn_generar.pack(side="left", padx=10)
+
+        # SUBIR: generar CSV + subir a SQL
+        self.btn_subir = tk.Button(
+            btn_frame, text="SUBIR", width=15, height=1,
+            bg="#18a957", fg="white", font=("Arial", 11, "bold"),
+            relief="flat", cursor="hand2",
+            command=lambda: self.crear_maestro(upload_sql=True)
+        )
+        self.btn_subir.pack(side="left", padx=10)
+
+        tk.Button(
+            btn_frame, text="CANCELAR", width=15, height=1,
+            bg="#d6453d", fg="white", font=("Arial", 11, "bold"),
+            relief="flat", cursor="hand2", command=self.cancelar
+        ).pack(side="left", padx=10)
+
+        self.progress = ttk.Progressbar(card_frame, orient="horizontal", length=100, mode="determinate")
+        self.progress.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(20, 0))
+
+        self.status = tk.Label(card_frame, text="Listo", fg="gray", bg=COLOR_CARD, font=("Arial", 9))
+        self.status.grid(row=8, column=0, columnspan=3, sticky="w", pady=(5, 0))
+
+    def _input_row(self, parent, row, label_text, var, cmd, btn_color):
+        lbl = tk.Label(parent, text=label_text, bg="#FFFFFF", font=("Arial", 11, "bold"), fg="#333333")
+        lbl.grid(row=row, column=0, sticky="e", padx=(10, 10), pady=12)
+
+        entry = tk.Entry(parent, textvariable=var, font=("Arial", 11), bg="#F9F9F9", relief="solid", bd=1)
+        entry.grid(row=row, column=1, sticky="ew", padx=10, pady=12, ipady=3)
+        parent.grid_columnconfigure(1, weight=1)
+
+        btn = tk.Button(parent, text="Buscar", bg=btn_color, fg="white", font=("Arial", 10, "bold"),
+                        relief="flat", cursor="hand2", command=cmd, width=10)
+        btn.grid(row=row, column=2, padx=(0, 10), pady=12)
+
+    def _text_row(self, parent, row, label_text, var):
+        lbl = tk.Label(parent, text=label_text, bg="#FFFFFF", font=("Arial", 11, "bold"), fg="#333333")
+        lbl.grid(row=row, column=0, sticky="e", padx=(10, 10), pady=12)
+
+        entry = tk.Entry(parent, textvariable=var, font=("Arial", 11), bg="#F9F9F9", relief="solid", bd=1)
+        entry.grid(row=row, column=1, sticky="ew", padx=10, pady=12, ipady=3)
+
+        filler = tk.Label(parent, text="", bg="#FFFFFF")
+        filler.grid(row=row, column=2, padx=(0, 10), pady=12)
+
+    def _password_row(self, parent, row, label_text, var):
+        lbl = tk.Label(parent, text=label_text, bg="#FFFFFF", font=("Arial", 11, "bold"), fg="#333333")
+        lbl.grid(row=row, column=0, sticky="e", padx=(10, 10), pady=12)
+
+        entry = tk.Entry(parent, textvariable=var, font=("Arial", 11), bg="#F9F9F9",
+                         relief="solid", bd=1, show="*")
+        entry.grid(row=row, column=1, sticky="ew", padx=10, pady=12, ipady=3)
+
+        def toggle():
+            entry.configure(show="" if entry.cget("show") == "*" else "*")
+
+        btn = tk.Button(parent, text="Ver", bg="#555555", fg="white", font=("Arial", 10, "bold"),
+                        relief="flat", cursor="hand2", command=toggle, width=10)
+        btn.grid(row=row, column=2, padx=(0, 10), pady=12)
+
+    def buscar_reporte(self):
+        path = filedialog.askopenfilename(
+            title="Selecciona el Reporte Acumulado",
+            filetypes=[("Archivos Excel", "*.xlsx *.xls *.xlsb")]
+        )
+        if path:
+            self.reporte_path.set(path)
+            self.status.config(text="Reporte Acumulado seleccionado.")
+
+    def buscar_separaciones(self):
+        paths = filedialog.askopenfilenames(
+            title="Selecciona TODOS los Archivos Separación / Analítica",
+            filetypes=[("Archivos Excel", "*.xlsx *.xls *.xlsb")]
+        )
+        if paths:
+            self.separacion_paths = list(paths)
+            if len(paths) == 1:
+                self.separacion_label.set(paths[0])
+            else:
+                self.separacion_label.set(f"{len(paths)} archivos seleccionados")
+            self.status.config(text=f"Separación/Analítica: {len(paths)} archivo(s) seleccionado(s).")
+
+    # ✅ crear_maestro ahora puede: solo CSV (upload_sql=False) o CSV+SQL (upload_sql=True)
+    def crear_maestro(self, upload_sql: bool = True):
+        rep = self.reporte_path.get().strip()
+        sep_paths = list(self.separacion_paths)
+        pwd = self.sql_password.get()
+        srv = self.sql_server.get().strip()
+        prt = self.sql_port.get().strip()
+
+        if not rep or not os.path.exists(rep):
+            messagebox.showwarning("Falta archivo", "Selecciona el Reporte Acumulado primero.")
+            return
+        if not sep_paths or any((not p or not os.path.exists(p)) for p in sep_paths):
+            messagebox.showwarning("Falta archivo", "Selecciona uno o más Archivos Separación válidos.")
+            return
+
+        # Validación SQL solo si se va a subir
+        if upload_sql:
+            if not pwd:
+                messagebox.showwarning("Falta contraseña", "Introduce la contraseña del usuario sa.")
+                return
+            if not srv:
+                messagebox.showwarning("Falta servidor", "Introduce el servidor SQL (IP).")
+                return
+            if not prt.isdigit():
+                messagebox.showwarning("Puerto inválido", "El puerto debe ser numérico (ej. 1433).")
+                return
+
+        self.btn_subir.config(state="disabled")
+        self.btn_generar.config(state="disabled")
+        self.status.config(text="Procesando...")
+        self.progress["value"] = 0
+        self.update_idletasks()
+
+        try:
+            # ==========================================================
+            # REPORTE ACUMULADO (UNIVERSO DE LINEAS)
+            # ==========================================================
+            rep_cols = [
+                "LÍNEA","LINEA","TELÉFONO","TELEFONO",
+                "SIM","ID PORT","IDPORT","ID_PORT",
+                "FECHA EXITOSO","FECHA PORTIN","FECHA CAPTURA",
+                "FECHA PROCESAMIENTO EXITOSO",
+                "FECHA ACTIVACIÓN","FECHA ACTIVACION",
+                "ESTATUS ACTUAL","DONADOR","FECHA PORTOUT",
+                "NOMBRE PROMOTOR","APSI PROMOTOR",
+                "NOMBRE SUPERVISOR","APSI SUPERVISOR",
+                "GRUPO","GRUPO SUPERVISOR",
+                "NOMBRE COORDINADOR","APSI COORDINADOR",
+                "FECHA INGRESO PROMOTOR",
+                "CIUDAD PORTABILIDAD","PLAZA",
+                "REGIÓN","REGION"
+            ]
+
+            df_rep = read_excel_fast(rep, sheet_name=0, needed_headers_human=rep_cols)
+            linea_col = safe_pick_col(df_rep, "LÍNEA","LINEA","TELÉFONO","TELEFONO")
+            if not linea_col:
+                raise ValueError("Reporte Acumulado: no encontré LÍNEA/LINEA/TELÉFONO")
+
+            df_rep_out = pd.DataFrame({"LINEA": normalize_line_series(df_rep[linea_col])})
+            df_rep_out["ID_PORT"] = pick_series(df_rep, "ID PORT","IDPORT","ID_PORT", required=False)
+            df_rep_out["SIM"] = pick_series(df_rep, "SIM", required=False)
+            df_rep_out["FECHA_CAPTURA"] = pick_series(df_rep, "FECHA CAPTURA", "FECHA PORTIN", required=False)
+            df_rep_out["FECHA_EXITOSO"] = pick_series(df_rep, "FECHA EXITOSO", required=False)
+            df_rep_out["FECHA_PROC_EXITOSO"] = pick_series(df_rep, "FECHA PROCESAMIENTO EXITOSO", required=False)
+
+            prim = pick_series(df_rep, "FECHA ULT RECARGA", "FECHA PORTIN", required=False)
+            df_rep_out["FECHA_PRIM_ING"] = prim
+            df_rep_out["FECHA_ALTA"] = prim
+
+            df_rep_out["FECHA_ACTIVACION"] = pick_series(df_rep, "FECHA ACTIVACIÓN", "FECHA ACTIVACION", required=False)
+            df_rep_out["ESTATUS_ACTUAL"] = pick_series(df_rep, "ESTATUS ACTUAL", required=False)
+            df_rep_out["DONADOR"] = pick_series(df_rep, "DONADOR", required=False)
+            df_rep_out["FECHA_PORTOUT"] = pick_series(df_rep, "FECHA PORTOUT", required=False)
+            df_rep_out["PROMOTOR"] = pick_series(df_rep, "NOMBRE PROMOTOR", required=False)
+            df_rep_out["NUM_PROMOTOR"] = pick_series(df_rep, "APSI PROMOTOR", required=False)
+            df_rep_out["FECHA_ALTA_PROMOTOR"] = pick_series(df_rep, "FECHA INGRESO PROMOTOR", required=False)
+            df_rep_out["SUPERVISOR"] = pick_series(df_rep, "NOMBRE SUPERVISOR", required=False)
+            df_rep_out["NUM_SUPERVISOR"] = pick_series(df_rep, "APSI SUPERVISOR", required=False)
+            df_rep_out["GPO_SUPERVISOR"] = pick_series(df_rep, "GRUPO SUPERVISOR", "GRUPO", required=False)
+            df_rep_out["COORDINADOR"] = pick_series(df_rep, "NOMBRE COORDINADOR", required=False)
+            df_rep_out["NUM_COORDINADOR"] = pick_series(df_rep, "APSI COORDINADOR", required=False)
+            df_rep_out["PLAZA"] = pick_series(df_rep, "CIUDAD PORTABILIDAD", "PLAZA", required=False)
+            df_rep_out["REGION"] = pick_series(df_rep, "REGIÓN", "REGION", required=False)
+
+            df_rep_out = dedup_fast(df_rep_out, "LINEA")
+            reporte_lineas = set(df_rep_out["LINEA"].dropna().astype(str))
+
+            self.progress["value"] = 30
+            self.update_idletasks()
+
+            # ==========================================================
+            # SEPARACIÓN/ANALÍTICA
+            # ==========================================================
+            self.status.config(text=f"Leyendo separación/analítica ({len(sep_paths)} archivos)...")
+            self.update_idletasks()
+
+            df_ci_out, rec_wide, bp_wide = load_all_separacion(sep_paths, reporte_lineas)
+
+            self.progress["value"] = 75
+            self.update_idletasks()
+
+            # ==========================================================
+            # MERGE FINAL
+            # ==========================================================
+            merged = df_rep_out.copy()
+            merged = merged.merge(df_ci_out, on="LINEA", how="left")
+            merged = merged.merge(rec_wide,  on="LINEA", how="left")
+            merged = merged.merge(bp_wide,   on="LINEA", how="left")
+
+            # ==========================================================
+            # MESES (PP1=+2, PP2=+3, ...), SOLO si el PP tiene data
+            # Base preferida: MES_COM_INIC (si es válido)
+            # Fallback: FECHA_PRIM_ING (si MES_COM_INIC no sirve)
+            # ==========================================================
+            base_month = merged.get("MES_COM_INIC")
+            if base_month is not None:
+                base_month_norm = base_month.astype(str).str.strip().str.capitalize()
+            else:
+                base_month_norm = pd.Series([None] * len(merged), index=merged.index)
+
+            valid_month = base_month_norm.astype(str).str.upper().isin(MESES_ES_INV.keys())
+
+            prim_dt = excel_serial_to_datetime(merged.get("FECHA_PRIM_ING"))
+            fallback_month = month_name_es_from_series(prim_dt)
+
+            base_month_final = base_month_norm.where(valid_month, fallback_month)
+
+            def _has_value(colname: str) -> pd.Series:
+                if colname and colname in merged.columns:
+                    return merged[colname].notna() & merged[colname].astype(str).str.strip().ne("")
+                return pd.Series([False] * len(merged), index=merged.index)
+
+            def _pp_has_data(pp: int) -> pd.Series:
+                monto_col = PP_MONTO_COL.get(pp)
+                est_col   = f"ESTATUS_REC_PP{pp}"
+                return _has_value(monto_col) | _has_value(est_col)
+
+            for pp in PP_LIST:
+                col_mes = PP_MES_COL.get(pp)
+                if not col_mes or col_mes not in MASTER_HEADERS:
+                    continue
+
+                mask = _pp_has_data(pp)
+                mes_pp = add_months_from_month_name_es(base_month_final, pp + 1)
+
+                merged[col_mes] = None
+                merged.loc[mask, col_mes] = mes_pp.loc[mask]
+
+            # ---- BP1 ---- (mismo mes que PP2 => offset = 3)
+            if "MES_BP1" in MASTER_HEADERS:
+                mask_bp1 = _has_value("PP_BP1") | _has_value("MONTO_BP1") | _has_value("ESTATUS_BP1")
+                merged["MES_BP1"] = None
+                merged.loc[mask_bp1, "MES_BP1"] = add_months_from_month_name_es(base_month_final, 3).loc[mask_bp1]
+
+            # ---- BP2 ---- (mismo mes que PP4 => offset = 5)
+            if "MES_BP2" in MASTER_HEADERS:
+                mask_bp2 = _has_value("PP_BP2") | _has_value("MONTO_BP2") | _has_value("ESTATUS_BP2")
+                merged["MES_BP2"] = None
+                merged.loc[mask_bp2, "MES_BP2"] = add_months_from_month_name_es(base_month_final, 5).loc[mask_bp2]
+
+            # ==========================================================
+            # INGRESO_TOTAL
+            # ==========================================================
+            ingreso = to_float_series(merged.get("MONTO_COM_INIC", pd.Series([None]*len(merged)))).fillna(0)
+            for pp in PP_LIST:
+                col_total = PP_REC_TOTAL_COL[pp]
+                if col_total in merged.columns:
+                    ingreso = ingreso + to_float_series(merged[col_total]).fillna(0)
+            merged["INGRESO_TOTAL"] = ingreso
+
+            df_master = pd.DataFrame({col: [None] * len(merged) for col in MASTER_HEADERS})
+            for col in merged.columns:
+                if col in df_master.columns:
+                    df_master[col] = merged[col]
+
+            self.progress["value"] = 90
+            self.update_idletasks()
+
+            out_path = filedialog.asksaveasfilename(
+                title="Guardar MAESTRO como CSV...",
+                defaultextension=".csv",
+                initialfile="MAESTRO.csv",
+                filetypes=[("CSV", "*.csv")]
+            )
+            if not out_path:
+                self.status.config(text="Guardado cancelado.")
+                self.progress["value"] = 0
+                return
+
+            df_master.to_csv(out_path, index=False, encoding="utf-8-sig")
+
+            # ✅ si solo querías generar el CSV, termina aquí
+            if not upload_sql:
+                self.progress["value"] = 100
+                self.update_idletasks()
+                messagebox.showinfo("Listo", f"CSV generado:\n{out_path}\n\n(No se subió a SQL Server)")
+                self.status.config(text="CSV generado (sin SQL).")
+                return
+
+            # ==========================================================
+            # SUBIDA SQL con PROGRESO ✅
+            # ==========================================================
+            total_rows = len(df_master)
+
+            def on_progress(inserted, total):
+                if total and total > 0:
+                    pct = inserted / total
+                else:
+                    pct = 0.0
+                self.progress["value"] = 90 + (pct * 10.0)
+                self.status.config(text=f"Subiendo a SQL... {inserted:,}/{total:,} filas")
+                self.update_idletasks()
+
+            self.status.config(text=f"CSV guardado. Subiendo a SQL Server... 0/{total_rows} filas")
+            self.update_idletasks()
+
+            inserted, used_cols, _ = upload_dataframe_to_sqlserver(
+                df_master,
+                password=pwd,
+                server=srv,
+                port=prt,
+                database=SQL_DB,
+                table=SQL_TABLE,
+                user=SQL_USER,
+                progress_callback=on_progress,
+                chunk_size=5000
+            )
+
+            self.progress["value"] = 100
+            self.update_idletasks()
+
+            messagebox.showinfo(
+                "Listo",
+                f"Se creó el archivo:\n{out_path}\n\n"
+                f"Se insertaron {inserted} filas en:\n{srv}:{prt} / {SQL_DB} / {SQL_TABLE}\n\n"
+                f"Columnas insertadas ({len(used_cols)}):\n" + ", ".join(used_cols)
+            )
+            self.status.config(text="MAESTRO creado y cargado a la BD.")
+
+        except Exception:
+            messagebox.showerror("Error", traceback.format_exc())
+            self.status.config(text="Ocurrió un error.")
+            self.progress["value"] = 0
+        finally:
+            self.btn_subir.config(state="normal")
+            self.btn_generar.config(state="normal")
+
+    def cancelar(self):
+        self.reporte_path.set("")
+        self.separacion_paths = []
+        self.separacion_label.set("")
+        self.sql_password.set("")
+        self.sql_server.set(DEFAULT_SQL_SERVER)
+        self.sql_port.set(DEFAULT_SQL_PORT)
+        self.status.config(text="Listo")
+        self.progress["value"] = 0
+
+if __name__ == "__main__":
+    # pip install pandas openpyxl pyxlsb pillow pyodbc
+    App().mainloop()
